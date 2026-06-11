@@ -19,7 +19,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QSlider, QLabel, QFileDialog, QGroupBox, QRadioButton,
-    QMessageBox, QFrame,
+    QMessageBox, QFrame, QCheckBox,
 )
 
 
@@ -224,6 +224,10 @@ class MainWindow(QMainWindow):
         self.iso_slider.valueChanged.connect(self._on_iso_changed)
         ilay.addWidget(self.iso_label)
         ilay.addWidget(self.iso_slider)
+        self.cb_ssao = QCheckBox("SSAO (凹みの陰影・GPU依存)")
+        self.cb_ssao.setChecked(False)
+        self.cb_ssao.toggled.connect(self._on_ssao_toggled)
+        ilay.addWidget(self.cb_ssao)
         self.iso_box.setVisible(False)
         lay.addWidget(self.iso_box)
 
@@ -235,6 +239,10 @@ class MainWindow(QMainWindow):
         # --- 右: 3D ビュー ---
         self.plotter = QtInteractor(central)
         self.plotter.set_background("#1a1a2e", top="#16213e")
+        try:
+            self.plotter.enable_lightkit()  # 5灯のライトキットを明示的に有効化
+        except Exception:
+            pass
 
         root.addWidget(panel)
         root.addWidget(self.plotter.interactor, stretch=1)
@@ -300,7 +308,11 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------- rendering ---
     def _clear_actors(self):
-        self.plotter.clear()
+        # plotter.clear() はライトまで消すことがあるためアクターのみ個別に削除
+        if self.volume_actor is not None:
+            self.plotter.remove_actor(self.volume_actor, render=False)
+        if self.mesh_actor is not None:
+            self.plotter.remove_actor(self.mesh_actor, render=False)
         self.volume_actor = None
         self.mesh_actor = None
 
@@ -309,8 +321,10 @@ class MainWindow(QMainWindow):
             return
         self._clear_actors()
         if self.rb_volume.isChecked():
+            self._set_ssao(False)
             self._build_volume()
         else:
+            self._set_ssao(self.cb_ssao.isChecked())
             self._rebuild_isosurface()
         if reset_camera:
             self.plotter.reset_camera()
@@ -369,6 +383,16 @@ class MainWindow(QMainWindow):
 
         self.plotter.render()
 
+    def _set_ssao(self, on):
+        """SSAO (環境光遮蔽)。凹部に陰影が付き等値面の立体感が増す。"""
+        try:
+            if on and self.grid is not None:
+                self.plotter.enable_ssao(radius=self.grid.length * 0.02, blur=True)
+            else:
+                self.plotter.disable_ssao()
+        except Exception:
+            pass  # 古いGPU/ドライバで未対応でも動作は継続
+
     def _rebuild_isosurface(self):
         if self.grid is None or not self.rb_surface.isChecked():
             return
@@ -387,9 +411,14 @@ class MainWindow(QMainWindow):
                     mesh = mesh.decimate_pro(1.0 - 500_000 / mesh.n_points)
                 except Exception:
                     pass
+            # ボクセル段差を軽く平滑化 → 法線が滑らかになり陰影が乗る
+            try:
+                mesh = mesh.smooth_taubin(n_iter=30, pass_band=0.05)
+            except Exception:
+                pass
             self.mesh_actor = self.plotter.add_mesh(
                 mesh, color="#e8dcc8", smooth_shading=True,
-                pbr=True, metallic=0.05, roughness=0.45,
+                ambient=0.15, diffuse=0.85, specular=0.35, specular_power=15,
                 show_scalar_bar=False,
             )
         self.plotter.render()
@@ -406,6 +435,10 @@ class MainWindow(QMainWindow):
         self.ww_label.setText(f"幅 (WW): {self.ww_slider.value()}")
         self.op_label.setText(f"不透明度: {self.op_slider.value()}%")
         self._update_transfer_functions()
+
+    def _on_ssao_toggled(self, on):
+        self._set_ssao(on and self.rb_surface.isChecked())
+        self.plotter.render()
 
     def _on_iso_changed(self):
         self.iso_label.setText(f"しきい値: {self.iso_slider.value()}")
@@ -433,3 +466,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
