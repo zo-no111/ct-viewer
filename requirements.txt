@@ -1,0 +1,6 @@
+numpy
+pyvista
+pyvistaqt
+PySide6
+pydicom
+nibabel
