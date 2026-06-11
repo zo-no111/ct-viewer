@@ -133,6 +133,9 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
 
         self.grid = None
+        self.grid_lo = None      # しきい値ドラッグ中のプレビュー用 (1/2 解像度)
+        self.raw_arr = None      # 読み込んだ元データ (解像度切替用に保持)
+        self.raw_spacing = None
         self.volume_actor = None
         self.mesh_actor = None
         self.data_min = 0.0
@@ -141,7 +144,7 @@ class MainWindow(QMainWindow):
         # 等値面再計算の間引き用タイマー
         self._iso_timer = QTimer(self)
         self._iso_timer.setSingleShot(True)
-        self._iso_timer.setInterval(120)
+        self._iso_timer.setInterval(250)
         self._iso_timer.timeout.connect(self._rebuild_isosurface)
 
         self._build_ui()
@@ -184,6 +187,19 @@ class MainWindow(QMainWindow):
         mlay.addWidget(self.rb_volume)
         mlay.addWidget(self.rb_surface)
         lay.addWidget(mode_box)
+
+        # 表示解像度 (各軸の最大ボクセル数)
+        res_box = QGroupBox("表示解像度")
+        rlay = QHBoxLayout(res_box)
+        self.res_buttons = []
+        for label, dim in (("低", 128), ("中", 256), ("高", 384)):
+            rb = QRadioButton(label)
+            rb.setChecked(dim == 256)
+            rb._dim = dim
+            rb.toggled.connect(self._on_res_changed)
+            self.res_buttons.append(rb)
+            rlay.addWidget(rb)
+        lay.addWidget(res_box)
 
         # ウインドウ処理
         self.win_box = QGroupBox("ウインドウ処理")
@@ -271,15 +287,14 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "読み込みエラー", str(e))
             return
 
-        orig_shape = arr.shape
-        arr, spacing, downsampled = downsample(arr, spacing)
         # float32 より省メモリ・高速な int16 にできるなら変換 (CT/HU は通常この範囲)
         if (arr.dtype == np.float32 and np.all(np.isfinite(arr))
                 and arr.min() >= -32768 and arr.max() <= 32767
                 and np.allclose(arr, np.round(arr), atol=0.01)):
             arr = arr.astype(np.int16)
+        self.raw_arr = arr
+        self.raw_spacing = spacing
 
-        self.grid = make_grid(arr, spacing)
         # 外れ値に強いレンジ (0.5/99.5 パーセンタイル)
         self.data_min = float(np.percentile(arr, 0.5))
         self.data_max = float(np.percentile(arr, 99.5))
@@ -298,13 +313,33 @@ class MainWindow(QMainWindow):
         for s in (self.wl_slider, self.ww_slider, self.iso_slider):
             s.blockSignals(False)
         self._on_window_changed()  # ラベル更新
+        self._apply_resolution(reset_camera=True)
 
-        ds_note = f"\n表示用に間引き: {orig_shape} → {arr.shape}" if downsampled else ""
+    def _max_dim(self):
+        for rb in self.res_buttons:
+            if rb.isChecked():
+                return rb._dim
+        return MAX_DIM
+
+    def _apply_resolution(self, reset_camera=False):
+        """保持している元データから表示解像度に応じたグリッドを再構築する。"""
+        if self.raw_arr is None:
+            return
+        arr, spacing, downsampled = downsample(self.raw_arr, self.raw_spacing,
+                                               self._max_dim())
+        self.grid = make_grid(arr, spacing)
+        # しきい値プレビュー用の 1/2 解像度グリッド
+        arr_lo = arr[::2, ::2, ::2]
+        sp_lo = (spacing[0] * 2, spacing[1] * 2, spacing[2] * 2)
+        self.grid_lo = make_grid(np.ascontiguousarray(arr_lo), sp_lo)
+
+        ds_note = (f"\n表示用に間引き: {self.raw_arr.shape} → {arr.shape}"
+                   if downsampled else "")
         self.info_label.setText(
             f"形状: {arr.shape}\n値域: {arr.min():.0f} 〜 {arr.max():.0f}\n"
             f"spacing: ({spacing[0]:.2f}, {spacing[1]:.2f}, {spacing[2]:.2f})" + ds_note
         )
-        self._show_current_mode(reset_camera=True)
+        self._show_current_mode(reset_camera=reset_camera)
 
     # ---------------------------------------------------------- rendering ---
     def _clear_actors(self):
@@ -350,7 +385,7 @@ class MainWindow(QMainWindow):
             pass
         # ドラッグ中の目標フレームレート (高いほど操作が軽い)
         try:
-            self.plotter.iren.interactor.SetDesiredUpdateRate(30.0)
+            self.plotter.iren.interactor.SetDesiredUpdateRate(60.0)
         except AttributeError:
             pass
 
@@ -393,29 +428,32 @@ class MainWindow(QMainWindow):
         except Exception:
             pass  # 古いGPU/ドライバで未対応でも動作は継続
 
-    def _rebuild_isosurface(self):
+    def _rebuild_isosurface(self, preview=False):
+        """等値面を再構築。preview=True ならドラッグ中用に粗く高速に。"""
         if self.grid is None or not self.rb_surface.isChecked():
             return
+        grid = self.grid_lo if (preview and self.grid_lo is not None) else self.grid
         thr = float(self.iso_slider.value())
         if self.mesh_actor is not None:
             self.plotter.remove_actor(self.mesh_actor, render=False)
             self.mesh_actor = None
         try:
-            mesh = self.grid.contour([thr], scalars="values", method="flying_edges")
+            mesh = grid.contour([thr], scalars="values", method="flying_edges")
         except Exception:
-            mesh = self.grid.contour([thr], scalars="values")
+            mesh = grid.contour([thr], scalars="values")
         if mesh.n_points > 0:
-            # 巨大メッシュは間引いて軽量化 (見た目はほぼ変わらない)
-            if mesh.n_points > 500_000:
+            if not preview:
+                # 巨大メッシュは間引いて軽量化 (見た目はほぼ変わらない)
+                if mesh.n_points > 500_000:
+                    try:
+                        mesh = mesh.decimate_pro(1.0 - 500_000 / mesh.n_points)
+                    except Exception:
+                        pass
+                # ボクセル段差を軽く平滑化 → 法線が滑らかになり陰影が乗る
                 try:
-                    mesh = mesh.decimate_pro(1.0 - 500_000 / mesh.n_points)
+                    mesh = mesh.smooth_taubin(n_iter=30, pass_band=0.05)
                 except Exception:
                     pass
-            # ボクセル段差を軽く平滑化 → 法線が滑らかになり陰影が乗る
-            try:
-                mesh = mesh.smooth_taubin(n_iter=30, pass_band=0.05)
-            except Exception:
-                pass
             self.mesh_actor = self.plotter.add_mesh(
                 mesh, color="#e8dcc8", smooth_shading=True,
                 ambient=0.15, diffuse=0.85, specular=0.35, specular_power=15,
@@ -442,7 +480,12 @@ class MainWindow(QMainWindow):
 
     def _on_iso_changed(self):
         self.iso_label.setText(f"しきい値: {self.iso_slider.value()}")
-        self._iso_timer.start()  # 連続ドラッグ中は 120ms 間引き
+        self._rebuild_isosurface(preview=True)  # 粗い即時プレビュー
+        self._iso_timer.start()                 # 手を止めたら高解像度で確定
+
+    def _on_res_changed(self, checked):
+        if checked:
+            self._apply_resolution()
 
     def apply_preset(self, wl, ww):
         self.wl_slider.setValue(int(np.clip(wl, self.wl_slider.minimum(),
