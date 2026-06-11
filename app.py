@@ -23,6 +23,10 @@ from PySide6.QtWidgets import (
 )
 
 
+# 表示用の最大解像度 (各軸)。超える場合は自動間引き。画質を上げたければ大きく。
+MAX_DIM = 256
+
+
 # ---------------------------------------------------------------- loaders ---
 
 def load_npy(path):
@@ -89,6 +93,19 @@ def _normalize_dtype(arr):
     if arr.dtype in (np.float64, np.float16, np.int64, np.int32):
         return arr.astype(np.float32)
     return arr
+
+
+def downsample(arr_zyx, spacing, max_dim=MAX_DIM):
+    """各軸が max_dim を超える場合はストライド間引きし、spacing を補正する。"""
+    nz, ny, nx = arr_zyx.shape
+    kz = max(1, int(np.ceil(nz / max_dim)))
+    ky = max(1, int(np.ceil(ny / max_dim)))
+    kx = max(1, int(np.ceil(nx / max_dim)))
+    if (kz, ky, kx) == (1, 1, 1):
+        return arr_zyx, spacing, False
+    arr2 = np.ascontiguousarray(arr_zyx[::kz, ::ky, ::kx])
+    sx, sy, sz = spacing
+    return arr2, (sx * kx, sy * ky, sz * kz), True
 
 
 def make_grid(arr_zyx, spacing):
@@ -246,6 +263,14 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "読み込みエラー", str(e))
             return
 
+        orig_shape = arr.shape
+        arr, spacing, downsampled = downsample(arr, spacing)
+        # float32 より省メモリ・高速な int16 にできるなら変換 (CT/HU は通常この範囲)
+        if (arr.dtype == np.float32 and np.all(np.isfinite(arr))
+                and arr.min() >= -32768 and arr.max() <= 32767
+                and np.allclose(arr, np.round(arr), atol=0.01)):
+            arr = arr.astype(np.int16)
+
         self.grid = make_grid(arr, spacing)
         # 外れ値に強いレンジ (0.5/99.5 パーセンタイル)
         self.data_min = float(np.percentile(arr, 0.5))
@@ -266,9 +291,10 @@ class MainWindow(QMainWindow):
             s.blockSignals(False)
         self._on_window_changed()  # ラベル更新
 
+        ds_note = f"\n表示用に間引き: {orig_shape} → {arr.shape}" if downsampled else ""
         self.info_label.setText(
             f"形状: {arr.shape}\n値域: {arr.min():.0f} 〜 {arr.max():.0f}\n"
-            f"spacing: ({spacing[0]:.2f}, {spacing[1]:.2f}, {spacing[2]:.2f})"
+            f"spacing: ({spacing[0]:.2f}, {spacing[1]:.2f}, {spacing[2]:.2f})" + ds_note
         )
         self._show_current_mode(reset_camera=True)
 
@@ -301,6 +327,19 @@ class MainWindow(QMainWindow):
         prop.SetSpecular(0.4)
         prop.SetSpecularPower(20)
         prop.SetInterpolationTypeToLinear()
+
+        # 操作中は粗く・静止時は高品質にサンプリングを自動調整
+        mapper = self.volume_actor.mapper
+        try:
+            mapper.SetAutoAdjustSampleDistances(True)
+        except AttributeError:
+            pass
+        # ドラッグ中の目標フレームレート (高いほど操作が軽い)
+        try:
+            self.plotter.iren.interactor.SetDesiredUpdateRate(30.0)
+        except AttributeError:
+            pass
+
         self._update_transfer_functions()
 
     def _update_transfer_functions(self):
@@ -342,7 +381,12 @@ class MainWindow(QMainWindow):
         except Exception:
             mesh = self.grid.contour([thr], scalars="values")
         if mesh.n_points > 0:
-            mesh = mesh.compute_normals(point_normals=True, cell_normals=False)
+            # 巨大メッシュは間引いて軽量化 (見た目はほぼ変わらない)
+            if mesh.n_points > 500_000:
+                try:
+                    mesh = mesh.decimate_pro(1.0 - 500_000 / mesh.n_points)
+                except Exception:
+                    pass
             self.mesh_actor = self.plotter.add_mesh(
                 mesh, color="#e8dcc8", smooth_shading=True,
                 pbr=True, metallic=0.05, roughness=0.45,
